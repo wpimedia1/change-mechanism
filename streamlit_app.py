@@ -69,25 +69,26 @@ FIPS_TO_STATE = {
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def geocode(location: str) -> tuple:
-    """Convert a location string to (lat, lng, error_or_none)."""
+    """Convert a location string to (lat, lng, error_or_none).
+
+    Only successful results and genuine no-results are cached.
+    Transient errors (429, 5xx, timeouts) raise so st.cache_data skips them.
+    """
     if not location or not location.strip():
         return None, None, format_error("GeoError", "No location provided.")
-    try:
-        r = requests.get(
-            "https://nominatim.openstreetmap.org/search",
-            params={"q": location.strip(), "format": "json", "limit": 1},
-            headers={"User-Agent": "WhoRepMe-Streamlit/1.0"},
-            timeout=GEOCODE_TIMEOUT,
-        )
-        r.raise_for_status()
-        data = r.json()
-        if not data:
-            return None, None, format_error("GeoError", f"No results for '{location}'.")
-        return float(data[0]["lat"]), float(data[0]["lon"]), None
-    except requests.Timeout:
-        return None, None, format_error("GeoError", "Geocoding request timed out.")
-    except requests.RequestException as e:
-        return None, None, format_error("GeoError", str(e))
+
+    r = requests.get(
+        "https://nominatim.openstreetmap.org/search",
+        params={"q": location.strip(), "format": "json", "limit": 1},
+        headers={"User-Agent": "WhoRepMe-Streamlit/1.0"},
+        timeout=GEOCODE_TIMEOUT,
+    )
+    r.raise_for_status()  # 429/5xx raise → not cached
+
+    data = r.json()
+    if not data:
+        return None, None, format_error("GeoError", f"No results for '{location}'.")
+    return float(data[0]["lat"]), float(data[0]["lon"]), None
 
 
 # --- Census Geocoder: lat/lng to state + congressional district ---
@@ -98,59 +99,53 @@ def resolve_district(lat: float, lng: float) -> tuple:
 
     Census coordinates endpoint: x=longitude, y=latitude (note the swap).
     No API key required.
+    Transient errors (429, 5xx, timeouts) raise so st.cache_data skips them.
     """
-    try:
-        r = requests.get(
-            f"{BASE_CENSUS}/geographies/coordinates",
-            params={
-                "x": lng,
-                "y": lat,
-                "benchmark": "Public_AR_Current",
-                "vintage": "Current_Current",
-                "layers": "10",
-                "format": "json",
-            },
-            timeout=CENSUS_TIMEOUT,
+    r = requests.get(
+        f"{BASE_CENSUS}/geographies/coordinates",
+        params={
+            "x": lng,
+            "y": lat,
+            "benchmark": "Public_AR_Current",
+            "vintage": "Current_Current",
+            "layers": "10",
+            "format": "json",
+        },
+        timeout=CENSUS_TIMEOUT,
+    )
+    r.raise_for_status()  # 429/5xx raise → not cached
+
+    data = r.json()
+    geographies = data.get("result", {}).get("geographies", {})
+
+    # Key name varies by congress (e.g. "119th Congressional Districts")
+    cd_data = None
+    for key in geographies:
+        if "Congressional" in key:
+            districts = geographies[key]
+            if districts:
+                cd_data = districts[0]
+            break
+
+    if not cd_data:
+        return None, None, format_error(
+            "CensusError", "No congressional district found for these coordinates."
         )
-        r.raise_for_status()
-        data = r.json()
-        geographies = data.get("result", {}).get("geographies", {})
 
-        # Key name varies by congress (e.g. "119th Congressional Districts")
-        cd_data = None
-        for key in geographies:
-            if "Congressional" in key:
-                districts = geographies[key]
-                if districts:
-                    cd_data = districts[0]
-                break
+    state_fips = cd_data.get("STATE", "")
+    district_code = cd_data.get("CD", cd_data.get("CDSESSN", ""))
 
-        if not cd_data:
-            return None, None, format_error(
-                "CensusError", "No congressional district found for these coordinates."
-            )
+    if not state_fips:
+        return None, None, format_error("CensusError", "Missing state FIPS in response.")
 
-        state_fips = cd_data.get("STATE", "")
-        district_code = cd_data.get("CD", cd_data.get("CDSESSN", ""))
+    state_abbr = FIPS_TO_STATE.get(state_fips)
+    if not state_abbr:
+        return None, None, format_error("CensusError", f"Unknown state FIPS: {state_fips}")
 
-        if not state_fips:
-            return None, None, format_error("CensusError", "Missing state FIPS in response.")
+    # "00" = at-large (single-district states like WY, VT, AK)
+    district_num = int(district_code) if district_code and district_code.isdigit() else 0
 
-        state_abbr = FIPS_TO_STATE.get(state_fips)
-        if not state_abbr:
-            return None, None, format_error("CensusError", f"Unknown state FIPS: {state_fips}")
-
-        # "00" = at-large (single-district states like WY, VT, AK)
-        district_num = int(district_code) if district_code and district_code.isdigit() else 0
-
-        return state_abbr, district_num, None
-
-    except requests.Timeout:
-        return None, None, format_error("CensusError", "Census geocoder timed out.")
-    except requests.RequestException as e:
-        return None, None, format_error("CensusError", str(e))
-    except (KeyError, IndexError, ValueError) as e:
-        return None, None, format_error("CensusError", f"Unexpected response format: {e}")
+    return state_abbr, district_num, None
 
 
 # --- OpenStates: state-level reps + bills ---
@@ -346,7 +341,11 @@ if st.button("Find My Representatives", type="primary", disabled=st.session_stat
             # 1) Resolve coordinates
             if loc:
                 status.update(label=f"Geocoding '{loc}'\u2026")
-                lat, lng, geo_err = geocode(loc)
+                try:
+                    lat, lng, geo_err = geocode(loc)
+                except requests.RequestException as e:
+                    geo_err = format_error("GeoError", str(e))
+                    lat, lng = None, None
                 if geo_err:
                     output_area.error(geo_err)
                     status.update(label="Geocoding failed.", state="error")
@@ -418,11 +417,14 @@ if st.button("Find My Representatives", type="primary", disabled=st.session_stat
             if CONGRESS_API_KEY:
                 status.update(label="Resolving congressional district\u2026")
 
-                state_abbr, district_num, census_err = resolve_district(lat, lng)
+                try:
+                    state_abbr, district_num, census_err = resolve_district(lat, lng)
+                except Exception as e:
+                    state_abbr, district_num, census_err = None, None, str(e)
 
                 if census_err:
                     out.append("\n## Federal Representatives\n")
-                    out.append(f"*Could not resolve congressional district.*\n")
+                    out.append("*Could not resolve congressional district.*\n")
                 else:
                     district_label = (
                         f"{state_abbr} At-Large" if district_num == 0
