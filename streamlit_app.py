@@ -1,394 +1,138 @@
 import streamlit as st
-import time
 import json
+import time
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-# ======= CONFIG =======
-try:
-    OPEN_API_KEY = st.secrets["OPEN_API_KEY"]
-except KeyError:
-    st.error("Missing `OPEN_API_KEY` in Streamlit secrets.")
-    st.stop()
-
+# ======= CONFIG (using st.secrets) =======
+# Load from ./.streamlit/secrets.toml
+OPEN_API_KEY = st.secrets.get("OPEN_API_KEY")
 CONGRESS_API_KEY = st.secrets.get("CONGRESS_API_KEY", "")
+MAPS_API_KEY = st.secrets.get("MAPS_API_KEY")
+
+if not OPEN_API_KEY:
+    st.error("Missing OPEN_API_KEY in Streamlit secrets. Please add it to ./.streamlit/secrets.toml")
+    st.stop()
+    
+if not MAPS_API_KEY:
+    st.warning("Missing MAPS_API_KEY. Geocoding from City/State will fail. Please add it to your secrets.")
 
 BASE_OS = "https://v3.openstates.org"
 BASE_CONG = "https://api.congress.gov/v3"
-BASE_CENSUS = "https://geocoding.geo.census.gov/geocoder"
 
 HEADERS_OS = {"X-Api-Key": OPEN_API_KEY}
+HEADERS_CONG = {"X-Api-Key": CONGRESS_API_KEY} if CONGRESS_API_KEY else {}
 
-CURRENT_CONGRESS = 119
-
-# ======= CONSTANTS =======
-GEOCODE_TIMEOUT = 12
-CENSUS_TIMEOUT = 15
-API_TIMEOUT = 20
-CONGRESS_TIMEOUT = 16
-RATE_LIMIT_PAUSE = 2.0
-INTER_REP_PAUSE = 0.15
-BILLS_PER_PAGE = 5
-COOLDOWN_SECONDS = 5
-
-FIPS_TO_STATE = {
-    "01": "AL", "02": "AK", "04": "AZ", "05": "AR", "06": "CA",
-    "08": "CO", "09": "CT", "10": "DE", "11": "DC", "12": "FL",
-    "13": "GA", "15": "HI", "16": "ID", "17": "IL", "18": "IN",
-    "19": "IA", "20": "KS", "21": "KY", "22": "LA", "23": "ME",
-    "24": "MD", "25": "MA", "26": "MI", "27": "MN", "28": "MS",
-    "29": "MO", "30": "MT", "31": "NE", "32": "NV", "33": "NH",
-    "34": "NJ", "35": "NM", "36": "NY", "37": "NC", "38": "ND",
-    "39": "OH", "40": "OK", "41": "OR", "42": "PA", "44": "RI",
-    "45": "SC", "46": "SD", "47": "TN", "48": "TX", "49": "UT",
-    "50": "VT", "51": "VA", "53": "WA", "54": "WV", "55": "WI",
-    "56": "WY", "60": "AS", "66": "GU", "69": "MP", "72": "PR",
-    "78": "VI",
-}
-
-
-# ======= UTILITIES =======
-
-def format_error(name: str, message: str) -> str:
-    return f"**{name}:** {message}"
-
-
-def safe_get(url, params=None, headers=None, timeout=15, label="API"):
-    """Make a GET request with retry on 429. Returns (response, error_string)."""
-    try:
-        r = requests.get(url, params=params, headers=headers, timeout=timeout)
-        if r.status_code == 429:
-            time.sleep(RATE_LIMIT_PAUSE)
-            r = requests.get(url, params=params, headers=headers, timeout=timeout)
-        if not r.ok:
-            return None, f"{label} returned HTTP {r.status_code}"
-        return r, None
-    except requests.Timeout:
-        return None, f"{label} request timed out"
-    except requests.RequestException as e:
-        return None, f"{label} error: {e}"
-
-
-# ======= GEOCODING =======
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def geocode(location: str):
-    """Nominatim geocode. Only caches success. Errors raise."""
-    r = requests.get(
-        "https://nominatim.openstreetmap.org/search",
-        params={"q": location.strip(), "format": "json", "limit": 1},
-        headers={"User-Agent": "ChangeMechanism-Streamlit/1.0"},
-        timeout=GEOCODE_TIMEOUT,
+# ======= SESSION & RETRIES =======
+@st.cache_resource
+def get_requests_session():
+    """Creates a requests session with connection pooling and exponential backoff."""
+    session = requests.Session()
+    # Retries for 429 (Too Many Requests) and 5xx Server Errors
+    retry = Retry(
+        total=5,
+        backoff_factor=1, # Delays: 1s, 2s, 4s, 8s, 16s...
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"]
     )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+http_session = get_requests_session()
+
+# ======= UTIL =======
+def jerr(name, message, meta=None):
+    """Formats an error as a JSON markdown block."""
+    error = {
+        "error": {
+            "name": name,
+            "message": message
+        }
+    }
+    if meta is not None:
+        error["error"]["meta"] = meta
+    return "```json\n" + json.dumps(error, indent=2) + "\n```"
+
+def is_federal(juris: dict) -> bool:
+    """Checks if a jurisdiction dict represents the US Federal government."""
+    if not juris:
+        return False
+    n = (juris.get("name") or "").lower()
+    i = (juris.get("id") or "").lower()
+    c = (juris.get("classification") or "").lower()
+    return "united states" in n or "country:us" in i or c == "country"
+
+# ======= API CALLS =======
+@st.cache_data(ttl=3600)
+def _do_geocode(location):
+    """Internal cached function to hit Google Maps API. Raises ValueError on failure so errors aren't cached."""
+    if not MAPS_API_KEY:
+        raise ValueError("MAPS_API_KEY is not configured. Please add it to secrets.toml")
+    
+    url = "https://maps.googleapis.com/maps/api/geocode/json"
+    params = {"address": location, "key": MAPS_API_KEY}
+    r = http_session.get(url, params=params, timeout=12)
     r.raise_for_status()
     data = r.json()
-    if not data:
-        return None, None, f"No geocoding results for '{location}'."
-    return float(data[0]["lat"]), float(data[0]["lon"]), None
+    
+    if data.get("status") != "OK" or not data.get("results"):
+        raise ValueError(f"No results found for '{location}'. (Status: {data.get('status', 'Unknown')})")
+        
+    loc = data["results"][0]["geometry"]["location"]
+    return loc["lat"], loc["lng"]
 
+def geocode(location):
+    """Wrapper around cached geocode to catch errors and return them cleanly."""
+    if not location:
+        return None, None, jerr("GeoError", "No location provided.")
+    try:
+        lat, lng = _do_geocode(location)
+        return lat, lng, None
+    except Exception as e:
+        return None, None, jerr("GeoError", str(e))
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def resolve_district(lat: float, lng: float):
-    """Census Geocoder: lat/lng -> (state_abbr, district_num, error). Errors raise."""
-    r = requests.get(
-        f"{BASE_CENSUS}/geographies/coordinates",
-        params={
-            "x": lng, "y": lat,
-            "benchmark": "Public_AR_Current",
-            "vintage": "Current_Current",
-            "layers": "all",
-            "format": "json",
-        },
-        timeout=CENSUS_TIMEOUT,
-    )
+@st.cache_data(ttl=600)
+def fetch_people(lat, lng):
+    """Fetches people from OpenStates API by coordinates."""
+    params = {"lat": lat, "lng": lng, "include": ["offices"]}
+    # Exponential backoff automatically handles 429s here now
+    r = http_session.get(f"{BASE_OS}/people.geo", headers=HEADERS_OS, params=params, timeout=20)
     r.raise_for_status()
-    geographies = r.json().get("result", {}).get("geographies", {})
-    cd_data = None
-    for key in geographies:
-        if "Congressional" in key:
-            districts = geographies[key]
-            if districts:
-                cd_data = districts[0]
-            break
-    if not cd_data:
-        return None, None, "No congressional district found for these coordinates."
-    state_fips = cd_data.get("STATE", "")
+    return r.json().get("results", [])
 
-    # Extract district number. The NAME field is most reliable:
-    # e.g. "Congressional District 22" or "Congressional District (at Large)"
-    district_code = ""
-    name_field = cd_data.get("NAME", "")
-    if name_field:
-        # Pull digits from end of name like "Congressional District 22"
-        parts = name_field.strip().split()
-        if parts and parts[-1].isdigit():
-            district_code = parts[-1]
+@st.cache_data(ttl=600)
+def fetch_openstates_bills(person_id):
+    """Fetches recent bills for a state-level person."""
+    params = {"sponsor": person_id, "sort": "updated_desc", "per_page": 5}
+    try:
+        r = http_session.get(f"{BASE_OS}/bills", headers=HEADERS_OS, params=params, timeout=18)
+        r.raise_for_status()
+        bills = r.json().get("results", [])
+        return [f"- {b.get('identifier','?')} — {b.get('title','No title')}" for b in bills] or ["- None"]
+    except requests.exceptions.RequestException as e:
+        return [f"- OpenStates bills error: {str(e)}"]
 
-    # Fallback: look for CD### field (e.g. CD119) where value is the district number
-    if not district_code:
-        for field_key, val in cd_data.items():
-            # Match CD119, CD118, etc. but not CENTLAT, CENTLON, CDSESSN
-            if (field_key.startswith("CD")
-                    and len(field_key) <= 5
-                    and field_key not in ("CENTLAT", "CENTLON")
-                    and val is not None
-                    and str(val).isdigit()
-                    and int(str(val)) < 100):  # district numbers are under 100
-                district_code = str(val)
-                break
-
-    # Last fallback
-    if not district_code:
-        district_code = str(cd_data.get("CD", cd_data.get("CDSESSN", "0")))
-
-    state_abbr = FIPS_TO_STATE.get(state_fips)
-    if not state_abbr:
-        return None, None, f"Unknown state FIPS: {state_fips}"
-    district_num = int(district_code) if district_code and str(district_code).isdigit() else 0
-    return state_abbr, district_num, None
-
-
-# ======= OPENSTATES: STATE REPS + CONTACT + BILLS =======
-
-@st.cache_data(ttl=600, show_spinner=False)
-def fetch_state_reps(lat: float, lng: float):
-    """Returns (list_of_people, error_string). Transient errors raise to skip cache."""
-    r = requests.get(
-        f"{BASE_OS}/people.geo",
-        params={"lat": lat, "lng": lng, "include": "offices"},
-        headers=HEADERS_OS,
-        timeout=API_TIMEOUT,
-    )
-    if r.status_code == 429:
-        time.sleep(RATE_LIMIT_PAUSE)
-        r = requests.get(
-            f"{BASE_OS}/people.geo",
-            params={"lat": lat, "lng": lng, "include": "offices"},
-            headers=HEADERS_OS,
-            timeout=API_TIMEOUT,
-        )
-    r.raise_for_status()  # 500/429/etc raise → not cached
-    return r.json().get("results", []), None
-
-
-@st.cache_data(ttl=600, show_spinner=False)
-def fetch_state_bills(person_id: str) -> list[str]:
-    r, err = safe_get(
-        f"{BASE_OS}/bills",
-        params={"sponsor": person_id, "sort": "updated_desc", "per_page": BILLS_PER_PAGE},
-        headers=HEADERS_OS,
-        timeout=API_TIMEOUT,
-        label="OpenStates bills",
-    )
-    if err:
-        return [f"- {err}"]
-    bills = r.json().get("results", [])
-    return [
-        f"- **{b.get('identifier', '?')}** — {b.get('title', 'No title')}"
-        for b in bills
-    ] or ["- No recent bills found"]
-
-
-def render_state_rep(p: dict) -> list[str]:
-    """Render one state-level rep as markdown lines."""
-    lines = []
-    name = p.get("name", "N/A")
-    party = p.get("party", "Unknown")
-    role = (p.get("current_role") or {}).get("title", "Unknown")
-    juris = p.get("jurisdiction") or {}
-
-    lines.append(f"### {name} ({party}) — {role}")
-    lines.append(f"**Jurisdiction:** {juris.get('name', 'Unknown')}")
-
-    # Contact: offices array from OpenStates
-    offices = p.get("offices", []) or p.get("contact_details", [])
-    if offices:
-        lines.append("**Contact:**")
-        for o in offices:
-            if not isinstance(o, dict):
-                continue
-            parts = []
-            addr = o.get("address") or o.get("value") or ""
-            voice = o.get("voice") or o.get("voice_number") or ""
-            fax = o.get("fax") or ""
-            email = o.get("email") or ""
-            name_label = o.get("name") or o.get("note") or ""
-            if name_label:
-                parts.append(f"**{name_label}**")
-            if addr:
-                parts.append(addr)
-            if voice:
-                parts.append(f"Phone: {voice}")
-            if fax:
-                parts.append(f"Fax: {fax}")
-            if email:
-                parts.append(f"Email: {email}")
-            if parts:
-                lines.append("- " + " | ".join(parts))
-
-    # Links
-    links = p.get("links", [])
-    if links:
-        for lnk in links:
-            if isinstance(lnk, dict) and lnk.get("url"):
-                lines.append(f"- Website: {lnk['url']}")
-
-    # Email at top level
-    top_email = p.get("email")
-    if top_email:
-        lines.append(f"- Email: {top_email}")
-
-    # Bills
-    lines.append("\n**Recent Sponsored Bills:**")
-    lines += fetch_state_bills(person_id=p.get("id", ""))
-
-    lines.append("\n---\n")
-    return lines
-
-
-# ======= CONGRESS.GOV: FEDERAL REPS + CONTACT + BILLS =======
-
-@st.cache_data(ttl=600, show_spinner=False)
-def fetch_federal_members(state: str, district: int):
-    """Get current federal members for a state. Returns (list_of_dicts, error)."""
+@st.cache_data(ttl=600)
+def fetch_congress_bills_by_name(name):
+    """Fetches recent bills from Congress.gov by name."""
     if not CONGRESS_API_KEY:
-        return [], "CONGRESS_API_KEY not configured"
-
-    r, err = safe_get(
-        f"{BASE_CONG}/member/congress/{CURRENT_CONGRESS}/{state}",
-        params={"format": "json", "api_key": CONGRESS_API_KEY, "currentMember": "true", "limit": 20},
-        timeout=CONGRESS_TIMEOUT,
-        label="Congress.gov member list",
-    )
-    if err:
-        return [], err
-
-    raw_members = r.json().get("members", [])
-    results = []
-    for m in raw_members:
-        terms = m.get("terms", {}).get("item", [])
-        chamber = terms[-1].get("chamber", "") if terms else ""
-        role = "Senator" if chamber == "Senate" else "Representative"
-        m_district = m.get("district")
-
-        # Filter: keep senators; keep only the matching district rep
-        if role == "Senator":
-            pass  # always keep
-        elif role == "Representative":
-            if m_district is not None:
-                try:
-                    if int(m_district) != district:
-                        continue
-                except (ValueError, TypeError):
-                    continue
-            elif district != 0:
-                continue  # skip if we can't match district
-
-        results.append({
-            "name": m.get("name", "Unknown"),
-            "party": m.get("partyName", "Unknown"),
-            "role": role,
-            "state": m.get("state", state),
-            "district": m_district,
-            "bioguideId": m.get("bioguideId", ""),
-            "depiction": m.get("depiction", {}),
-            "url": m.get("url", ""),
-        })
-
-    return results, None
-
-
-@st.cache_data(ttl=600, show_spinner=False)
-def fetch_member_detail(bioguide_id: str):
-    """Get full member detail including contact info. Returns (dict, error)."""
-    if not CONGRESS_API_KEY or not bioguide_id:
-        return {}, "No API key or bioguide ID"
-    r, err = safe_get(
-        f"{BASE_CONG}/member/{bioguide_id}",
-        params={"format": "json", "api_key": CONGRESS_API_KEY},
-        timeout=CONGRESS_TIMEOUT,
-        label="Congress.gov member detail",
-    )
-    if err:
-        return {}, err
-    return r.json().get("member", {}), None
-
-
-@st.cache_data(ttl=600, show_spinner=False)
-def fetch_sponsored_bills(bioguide_id: str) -> list[str]:
-    if not CONGRESS_API_KEY or not bioguide_id:
-        return ["- Congress.gov key not configured"]
-    r, err = safe_get(
-        f"{BASE_CONG}/member/{bioguide_id}/sponsored-legislation",
-        params={"format": "json", "api_key": CONGRESS_API_KEY, "limit": BILLS_PER_PAGE},
-        timeout=CONGRESS_TIMEOUT,
-        label="Congress.gov sponsored-legislation",
-    )
-    if err:
-        return [f"- {err}"]
-    bills = r.json().get("sponsoredLegislation", [])
-    return [
-        f"- **{b.get('type', '')}{b.get('number', '')}** ({b.get('congress', '')}) — "
-        f"{b.get('latestTitle', b.get('title', 'No title'))}"
-        for b in bills
-    ] or ["- No sponsored legislation found"]
-
-
-def render_federal_rep(member_summary: dict) -> list[str]:
-    """Render one federal rep as markdown: contact from detail endpoint + bills."""
-    lines = []
-    name = member_summary["name"]
-    party = member_summary["party"]
-    role = member_summary["role"]
-    bioguide = member_summary["bioguideId"]
-
-    lines.append(f"### {name} ({party}) — {role}")
-
-    # Fetch full detail for contact info
-    detail, detail_err = fetch_member_detail(bioguide)
-
-    if detail:
-        # Contact info
-        addr_info = detail.get("addressInformation", {})
-        if addr_info:
-            lines.append("**Contact:**")
-            office_addr = str(addr_info.get("officeAddress", "") or "")
-            city = str(addr_info.get("city", "") or "")
-            district_val = str(addr_info.get("district", "") or "")
-            zipcode = str(addr_info.get("zipCode", "") or "")
-            phone = str(addr_info.get("phoneNumber", "") or "")
-
-            full_addr = ", ".join(p for p in [office_addr, city, district_val, zipcode] if p)
-            if full_addr:
-                lines.append(f"- Office: {full_addr}")
-            if phone:
-                lines.append(f"- Phone: {phone}")
-
-        # Website
-        website = detail.get("officialWebsiteUrl", "")
-        if website:
-            lines.append(f"- Website: {website}")
-
-        # Portrait
-        depiction = detail.get("depiction", {})
-        img_url = depiction.get("imageUrl", "")
-        if img_url:
-            lines.append(f"- Portrait: {img_url}")
-
-    elif detail_err:
-        lines.append(f"*Contact info unavailable: {detail_err}*")
-
-    # Sponsored bills
-    lines.append("\n**Recent Sponsored Legislation:**")
-    lines += fetch_sponsored_bills(bioguide)
-
-    lines.append("\n---\n")
-    return lines
-
-
+        return ["- congress.gov key not configured"]
+    params = {"q": name, "format": "json", "limit": 5, "api_key": CONGRESS_API_KEY}
+    try:
+        r = http_session.get(f"{BASE_CONG}/bill", headers=HEADERS_CONG, params=params, timeout=16)
+        r.raise_for_status()
+        data = r.json() or {}
+        bills = data.get("bills", [])
+        return [f"- [{b.get('congress','')} {b.get('number','')}] {b.get('title','No title')}" for b in bills] or ["- None"]
+    except requests.exceptions.RequestException as e:
+        return [f"- Congress.gov error: {str(e)}"]
+    
 # ======= UI =======
-
 st.set_page_config(page_title="Who Represents Me", layout="wide")
-st.title("\U0001f3db\ufe0f Who Represents Me")
+st.title("🏛️ Who Represents Me")
 
 col1, col2, col3 = st.columns(3)
 with col1:
@@ -398,123 +142,101 @@ with col2:
 with col3:
     lng_in = st.number_input("Longitude", value=None, placeholder="e.g., -83.0458", format="%.6f")
 
-if "running" not in st.session_state:
+if 'running' not in st.session_state:
     st.session_state.running = False
-if "last_lookup_time" not in st.session_state:
-    st.session_state.last_lookup_time = 0.0
 
 output_area = st.empty()
-output_area.markdown("\U0001f539 Enter a location and click the button.")
+output_area.markdown("🔹 Ready")
 
 if st.button("Find My Representatives", type="primary", disabled=st.session_state.running):
-
-    elapsed = time.time() - st.session_state.last_lookup_time
-    if elapsed < COOLDOWN_SECONDS:
-        output_area.warning(f"Please wait {int(COOLDOWN_SECONDS - elapsed) + 1}s before searching again.")
-        st.stop()
-
-    st.session_state.last_lookup_time = time.time()
     st.session_state.running = True
     lat, lng = lat_in, lng_in
-    out: list[str] = []
-    total_reps = 0
-
-    with st.status("\u23f3 Starting lookup\u2026") as status:
+    out = [] 
+    
+    with st.status("⏳ Starting lookup…") as status:
         try:
-            # ── 1. GEOCODE ──
+            # 1) Resolve coordinates
             if loc:
-                status.update(label=f"Geocoding '{loc}'\u2026")
-                try:
-                    lat, lng, geo_err = geocode(loc)
-                except Exception as e:
-                    lat, lng, geo_err = None, None, str(e)
+                status.update(label=f"Geocoding '{loc}'...")
+                lat, lng, geo_err = geocode(loc)
                 if geo_err:
-                    output_area.error(format_error("Geocoding failed", geo_err))
+                    output_area.error(geo_err)
+                    status.error("Geocoding failed.")
                     st.session_state.running = False
-                    st.stop()
-
+                    st.rerun()
+            
             if lat is None or lng is None:
-                output_area.error("Please provide a City/State or coordinates.")
+                output_area.error(jerr("InputError", "Provide coordinates or a City, State string."))
+                status.warning("No location provided.")
                 st.session_state.running = False
-                st.stop()
+                st.rerun()
+            
+            # 2) People
+            loc_str = f"({lat:.6f}, {lng:.6f})"
+            status.update(label=f"📍 Resolving reps for {loc_str}…")
+            output_area.markdown(f"📍 Resolving representatives for **{loc_str}**…")
 
-            loc_str = f"({lat:.4f}, {lng:.4f})"
-            out.append(f"**Location:** {loc_str}\n")
-
-            # ── 2. STATE REPS (OpenStates) ──
-            status.update(label="Fetching state representatives\u2026")
-            output_area.markdown("\n".join(out) + "\n\n*Fetching state reps\u2026*")
-
-            state_err = None
-            state_people = []
             try:
-                state_people, state_err = fetch_state_reps(lat, lng)
-            except requests.RequestException as e:
-                state_err = str(e)
-            except Exception as e:
-                state_err = str(e)
+                people = fetch_people(lat, lng)
+            except requests.exceptions.RequestException as he:
+                output_area.error(jerr("HTTPError", str(he)))
+                status.error("Failed to fetch representatives.")
+                st.session_state.running = False
+                st.rerun()
+                
+            if not people:
+                output_area.warning(jerr("EmptyResults", "No representatives found.", {"lat": lat, "lng": lng}))
+                status.warning("No representatives found.")
+                st.session_state.running = False
+                st.rerun()
 
-            if state_err:
-                out.append(f"## State Representatives\n\n**Error:** {state_err}\n")
-            elif not state_people:
-                out.append("## State Representatives\n\n*None found for this location.*\n")
-            else:
-                out.append(f"## State Representatives ({len(state_people)} found)\n")
-                for p in state_people:
-                    total_reps += 1
-                    status.update(label=f"State rep {total_reps}: {p.get('name', '?')}\u2026")
-                    out += render_state_rep(p)
-                    output_area.markdown("\n".join(out))
-                    time.sleep(INTER_REP_PAUSE)
+            status.update(label=f"✅ Found {len(people)} reps. Fetching bills…")
 
-            # ── 3. FEDERAL REPS (Census + Congress.gov) ──
-            if CONGRESS_API_KEY:
-                status.update(label="Resolving congressional district\u2026")
-                output_area.markdown("\n".join(out) + "\n\n*Resolving congressional district\u2026*")
+            # 3) Build final Markdown
+            out = [f"**Location:** {loc_str}", ""]
+            
+            for idx, p in enumerate(people, start=1):
+                name = p.get("name", "N/A")
+                party = p.get("party", "Unknown")
+                role = (p.get("current_role") or {}).get("title", "Unknown")
+                juris = p.get("jurisdiction") or {}
+                out.append(f"### {name} ({party}) — {role}")
+                out.append(f"Jurisdiction: {juris.get('name','')}")
 
-                try:
-                    state_abbr, district_num, cd_err = resolve_district(lat, lng)
-                except Exception as e:
-                    state_abbr, district_num, cd_err = None, None, str(e)
+                # Offices / contact
+                offices = p.get("offices", []) or p.get("contact_details", [])
+                if offices:
+                    out.append("**Contact:**")
+                    for o in offices:
+                        if isinstance(o, dict):
+                            addr = o.get("address") or o.get("value") or ""
+                            voice = o.get("voice") or o.get("voice_number") or ""
+                            line = ", ".join([s for s in [addr, voice] if s])
+                            if line:
+                                out.append(f"- {line}")
 
-                if cd_err:
-                    out.append(f"## Federal Representatives\n\n**Error:** {cd_err}\n")
+                if is_federal(juris):
+                    out.append("\n**Federal (Congress.gov)**")
+                    out += fetch_congress_bills_by_name(name)
                 else:
-                    district_label = f"{state_abbr} At-Large" if district_num == 0 else f"{state_abbr}-{district_num}"
-                    out.append(f"## Federal Representatives ({district_label})\n")
+                    out.append("\n**State (OpenStates)**")
+                    out += fetch_openstates_bills(person_id=p.get("id",""))
 
-                    status.update(label=f"Fetching federal reps for {district_label}\u2026")
-                    output_area.markdown("\n".join(out) + "\n\n*Fetching federal reps\u2026*")
+                out.append("\n---\n")
+                
+                status_msg = f"Fetching bills for {name}... ({idx}/{len(people)})"
+                status.update(label=status_msg)
+                output_area.markdown("\n".join(out) + f"\n\n*({status_msg})*")
+                
+                time.sleep(0.12)
 
-                    fed_members, fed_err = fetch_federal_members(state_abbr, district_num)
-
-                    if fed_err:
-                        out.append(f"**Error:** {fed_err}\n")
-                    elif not fed_members:
-                        out.append("*No federal representatives found.*\n")
-                    else:
-                        for m in fed_members:
-                            total_reps += 1
-                            status.update(label=f"Federal rep {total_reps}: {m['name']}\u2026")
-                            out += render_federal_rep(m)
-                            output_area.markdown("\n".join(out))
-                            time.sleep(INTER_REP_PAUSE)
-            else:
-                out.append("## Federal Representatives\n\n*Add `CONGRESS_API_KEY` to secrets to enable.*\n")
-
-            # ── 4. DONE ──
-            if total_reps == 0:
-                out.append("\n**No representatives found for this location.**\n")
-                output_area.markdown("\n".join(out))
-                status.update(label="No results.", state="error")
-            else:
-                output_area.markdown("\n".join(out))
-                status.update(label=f"Done — {total_reps} representatives found.", state="complete")
-
-        except Exception as e:
-            out.append(f"\n\n**Unexpected error:** {e}")
+            # 4) Final update
+            status.success("Lookup Complete!")
             output_area.markdown("\n".join(out))
-            status.update(label="Error occurred.", state="error")
-
+            
+        except Exception as e:
+            output_area.error(jerr("UnhandledException", str(e)))
+            status.error("An unexpected error occurred.")
+        
         finally:
             st.session_state.running = False
