@@ -1,4 +1,3 @@
-# change-mechanism
 # 🏛️ Who Represents Me
 
 A Streamlit app that finds your elected representatives by location using the [OpenStates API](https://docs.openstates.org/api-v3/) and [Congress.gov API](https://api.congress.gov/), with recent bill activity for each legislator.
@@ -10,8 +9,8 @@ Enter a city/state or coordinates → get your state and federal reps, contact i
 ### 1. Clone and install
 
 ```bash
-git clone https://github.com/change-mechanism/who-represents-me.git
-cd who-represents-me
+git clone https://github.com/YOUR_USERNAME/change-mechanism.git
+cd change-mechanism
 pip install -r requirements.txt
 ```
 
