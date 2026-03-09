@@ -9,7 +9,7 @@ Enter a city/state or coordinates → get your state and federal reps, contact i
 ### 1. Clone and install
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/change-mechanism.git
+git clone https://github.com/wpimedia1/change-mechanism.git
 cd change-mechanism
 pip install -r requirements.txt
 ```
