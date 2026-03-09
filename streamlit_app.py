@@ -113,17 +113,32 @@ def resolve_district(lat: float, lng: float):
         return None, None, "No congressional district found for these coordinates."
     state_fips = cd_data.get("STATE", "")
 
-    # District code field name changes per congress: CD119, CD118, CD, CDSESSN, etc.
+    # Extract district number. The NAME field is most reliable:
+    # e.g. "Congressional District 22" or "Congressional District (at Large)"
     district_code = ""
-    for field_key in cd_data:
-        if field_key.startswith("CD") and field_key != "CENTLAT" and field_key != "CENTLON":
-            val = cd_data[field_key]
-            if val and str(val).isdigit():
+    name_field = cd_data.get("NAME", "")
+    if name_field:
+        # Pull digits from end of name like "Congressional District 22"
+        parts = name_field.strip().split()
+        if parts and parts[-1].isdigit():
+            district_code = parts[-1]
+
+    # Fallback: look for CD### field (e.g. CD119) where value is the district number
+    if not district_code:
+        for field_key, val in cd_data.items():
+            # Match CD119, CD118, etc. but not CENTLAT, CENTLON, CDSESSN
+            if (field_key.startswith("CD")
+                    and len(field_key) <= 5
+                    and field_key not in ("CENTLAT", "CENTLON")
+                    and val is not None
+                    and str(val).isdigit()
+                    and int(str(val)) < 100):  # district numbers are under 100
                 district_code = str(val)
                 break
+
+    # Last fallback
     if not district_code:
-        # Fallback: try known field names
-        district_code = cd_data.get("CD", cd_data.get("CDSESSN", ""))
+        district_code = str(cd_data.get("CD", cd_data.get("CDSESSN", "0")))
 
     state_abbr = FIPS_TO_STATE.get(state_fips)
     if not state_abbr:
@@ -136,16 +151,22 @@ def resolve_district(lat: float, lng: float):
 
 @st.cache_data(ttl=600, show_spinner=False)
 def fetch_state_reps(lat: float, lng: float):
-    """Returns (list_of_people, error_string)."""
-    r, err = safe_get(
+    """Returns (list_of_people, error_string). Transient errors raise to skip cache."""
+    r = requests.get(
         f"{BASE_OS}/people.geo",
-        params={"lat": lat, "lng": lng, "include": ["offices"]},
+        params={"lat": lat, "lng": lng, "include": "offices"},
         headers=HEADERS_OS,
         timeout=API_TIMEOUT,
-        label="OpenStates people.geo",
     )
-    if err:
-        return [], err
+    if r.status_code == 429:
+        time.sleep(RATE_LIMIT_PAUSE)
+        r = requests.get(
+            f"{BASE_OS}/people.geo",
+            params={"lat": lat, "lng": lng, "include": "offices"},
+            headers=HEADERS_OS,
+            timeout=API_TIMEOUT,
+        )
+    r.raise_for_status()  # 500/429/etc raise → not cached
     return r.json().get("results", []), None
 
 
@@ -330,11 +351,11 @@ def render_federal_rep(member_summary: dict) -> list[str]:
         addr_info = detail.get("addressInformation", {})
         if addr_info:
             lines.append("**Contact:**")
-            office_addr = addr_info.get("officeAddress", "")
-            city = addr_info.get("city", "")
-            district_val = addr_info.get("district", "")
-            zipcode = addr_info.get("zipCode", "")
-            phone = addr_info.get("phoneNumber", "")
+            office_addr = str(addr_info.get("officeAddress", "") or "")
+            city = str(addr_info.get("city", "") or "")
+            district_val = str(addr_info.get("district", "") or "")
+            zipcode = str(addr_info.get("zipCode", "") or "")
+            phone = str(addr_info.get("phoneNumber", "") or "")
 
             full_addr = ", ".join(p for p in [office_addr, city, district_val, zipcode] if p)
             if full_addr:
@@ -424,7 +445,14 @@ if st.button("Find My Representatives", type="primary", disabled=st.session_stat
             status.update(label="Fetching state representatives\u2026")
             output_area.markdown("\n".join(out) + "\n\n*Fetching state reps\u2026*")
 
-            state_people, state_err = fetch_state_reps(lat, lng)
+            state_err = None
+            state_people = []
+            try:
+                state_people, state_err = fetch_state_reps(lat, lng)
+            except requests.RequestException as e:
+                state_err = str(e)
+            except Exception as e:
+                state_err = str(e)
 
             if state_err:
                 out.append(f"## State Representatives\n\n**Error:** {state_err}\n")
