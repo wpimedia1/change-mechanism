@@ -10,7 +10,7 @@ Enter a city/state or coordinates → get your state and federal reps, contact i
 ### 1. Clone and install
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/who-represents-me.git
+git clone https://github.com/change-mechanism/who-represents-me.git
 cd who-represents-me
 pip install -r requirements.txt
 ```
