@@ -95,7 +95,7 @@ def resolve_district(lat: float, lng: float):
             "x": lng, "y": lat,
             "benchmark": "Public_AR_Current",
             "vintage": "Current_Current",
-            "layers": "10",
+            "layers": "all",
             "format": "json",
         },
         timeout=CENSUS_TIMEOUT,
@@ -112,11 +112,23 @@ def resolve_district(lat: float, lng: float):
     if not cd_data:
         return None, None, "No congressional district found for these coordinates."
     state_fips = cd_data.get("STATE", "")
-    district_code = cd_data.get("CD", cd_data.get("CDSESSN", ""))
+
+    # District code field name changes per congress: CD119, CD118, CD, CDSESSN, etc.
+    district_code = ""
+    for field_key in cd_data:
+        if field_key.startswith("CD") and field_key != "CENTLAT" and field_key != "CENTLON":
+            val = cd_data[field_key]
+            if val and str(val).isdigit():
+                district_code = str(val)
+                break
+    if not district_code:
+        # Fallback: try known field names
+        district_code = cd_data.get("CD", cd_data.get("CDSESSN", ""))
+
     state_abbr = FIPS_TO_STATE.get(state_fips)
     if not state_abbr:
         return None, None, f"Unknown state FIPS: {state_fips}"
-    district_num = int(district_code) if district_code and district_code.isdigit() else 0
+    district_num = int(district_code) if district_code and str(district_code).isdigit() else 0
     return state_abbr, district_num, None
 
 
