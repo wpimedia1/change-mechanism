@@ -85,6 +85,39 @@ def fetch_openstates_bills(person_id, juris_id):
     bills = r.json().get("results", [])
     return [f"- {b.get('identifier','?')} — {b.get('title','No title')}" for b in bills] or ["- None"]
 
+@st.cache_data(ttl=86400)
+def fetch_congress_members_by_state(state_code):
+    """Fetches current Congress members for a specific state to use as a fallback lookup."""
+    if not CONGRESS_API_KEY or not state_code: return []
+    params = {"format": "json", "api_key": CONGRESS_API_KEY, "limit": 250, "currentMember": "true"}
+    r = requests.get(f"{BASE_CONG}/member/{state_code}", params=params, timeout=15)
+    return r.json().get("members", []) if r.ok else []
+
+def resolve_bioguide_id(person_dict, state_code):
+    """Finds Bioguide ID directly from OpenStates or via a fallback Congress.gov name match."""
+    # 1. Native OpenStates check
+    for ident in person_dict.get("identifiers", []):
+        if ident.get("scheme") == "bioguide":
+            return ident.get("identifier")
+            
+    # 2. Fallback Congress.gov check (Last Name Match to handle nicknames)
+    if not state_code: return None
+    last_name = person_dict.get("name", "").split()[-1].lower()
+    
+    members = fetch_congress_members_by_state(state_code)
+    matches = [m for m in members if last_name in m.get("name", "").lower()]
+    
+    # If exactly one matching last name (e.g. only one "Cruz" in TX), return them safely
+    if len(matches) == 1:
+        return matches[0].get("bioguideId")
+        
+    # If multiple, require a first name match
+    first_name = person_dict.get("name", "").split()[0].lower()
+    for m in matches:
+        if first_name in m.get("name", "").lower():
+            return m.get("bioguideId")
+    return None
+
 @st.cache_data(ttl=600)
 def fetch_congress_bills(bioguide_id):
     """Fetches recent bills sponsored by a federal member from Congress.gov."""
@@ -176,6 +209,14 @@ if st.button("Find My Representatives", type="primary", disabled=st.session_stat
                 st.session_state.running = False
                 st.stop()
 
+            # Extract state code for fallback Congress member lookup
+            state_code = None
+            for p in people:
+                jid = p.get("jurisdiction", {}).get("id", "")
+                if "state:" in jid:
+                    state_code = jid.split("state:")[1].split("/")[0].upper()
+                    break
+
             status.update(label=f"✅ Found {len(people)} reps. Fetching bills…")
 
             # 3) Build final Markdown (with gentle pacing)
@@ -205,8 +246,8 @@ if st.button("Find My Representatives", type="primary", disabled=st.session_stat
                 if is_federal(juris):
                     out.append("\n**Federal (Congress.gov)**")
                     
-                    # FIX: Extract Bioguide ID directly from OpenStates payload
-                    bioguide_id = next((i.get("identifier") for i in p.get("identifiers", []) if i.get("scheme") == "bioguide"), None)
+                    # FIX: Use fallback function to get missing Bioguide IDs for reps like Cornyn/Cruz
+                    bioguide_id = resolve_bioguide_id(p, state_code)
                     
                     if bioguide_id:
                         out += fetch_congress_bills(bioguide_id)
