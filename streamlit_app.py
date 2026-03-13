@@ -121,10 +121,17 @@ def resolve_bioguide_id(person_dict, state_code):
     last_name = name_parts[-1].lower()
     
     members = fetch_congress_members_by_state(state_code)
+    
+    # Attempt 1: Match both first and last name
     for m in members:
         m_name = m.get("name", "").lower()
         if last_name in m_name and first_name in m_name:
             return m.get("bioguideId")
+            
+    # Attempt 2: Match just last name (handles nicknames like Chuck vs Charles)
+    last_name_matches = [m for m in members if last_name in m.get("name", "").lower()]
+    if len(last_name_matches) == 1:
+        return last_name_matches[0].get("bioguideId")
             
     return None
 
