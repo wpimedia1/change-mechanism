@@ -1,5 +1,6 @@
 import streamlit as st
 import os, time, json, requests
+import datetime
 
 # ======= CONFIG (using st.secrets) =======
 # Load from ./.streamlit/secrets.toml
@@ -17,11 +18,8 @@ HEADERS_OS = {"X-Api-Key": OPEN_API_KEY}
 HEADERS_CONG = {"X-Api-Key": CONGRESS_API_KEY} if CONGRESS_API_KEY else {}
 
 # ======= UTIL =======
-# (These functions are copied directly from your script)
-
 def jerr(name, message, meta=None):
     """Formats an error as a JSON markdown block."""
-    import json
     error = {
         "error": {
             "name": name,
@@ -32,7 +30,7 @@ def jerr(name, message, meta=None):
         error["error"]["meta"] = meta
     return "```json\n" + json.dumps(error, indent=2) + "\n```"
 
-@st.cache_data(ttl=3600) # Cache geocoding results for 1 hour
+@st.cache_data(ttl=3600)
 def geocode(location):
     """Converts a location string to (lat, lng) or returns an error."""
     if not location:
@@ -59,10 +57,12 @@ def is_federal(juris: dict) -> bool:
     n = (juris.get("name") or "").lower()
     i = (juris.get("id") or "").lower()
     c = (juris.get("classification") or "").lower()
-    return "united states" in n or "country:us" in i or c == "country"
+    # FIXED: Use exact matches. The 'in' operator was falsely matching 
+    # state strings like "ocd-jurisdiction/country:us/state:ky/government"
+    return n == "united states" or i == "ocd-jurisdiction/country:us/government" or c == "country"
 
 # ======= API CALLS (Cached) =======
-@st.cache_data(ttl=600) # Cache people results for 10 minutes
+@st.cache_data(ttl=600)
 def fetch_people(lat, lng):
     """Fetches people from OpenStates API by coordinates."""
     params = {"lat": lat, "lng": lng, "include": ["offices"]}
@@ -74,9 +74,10 @@ def fetch_people(lat, lng):
     return r.json().get("results", [])
 
 @st.cache_data(ttl=600)
-def fetch_openstates_bills(person_id):
+def fetch_openstates_bills(person_id, juris_id):
     """Fetches recent bills for a state-level person."""
-    params = {"sponsor": person_id, "sort": "updated_desc", "per_page": 5}
+    # FIXED: Added required 'jurisdiction' parameter for OpenStates v3 bills endpoint to prevent 400 error
+    params = {"sponsor": person_id, "jurisdiction": juris_id, "sort": "updated_desc", "per_page": 5}
     r = requests.get(f"{BASE_OS}/bills", headers=HEADERS_OS, params=params, timeout=18)
     if r.status_code == 429:
         time.sleep(1.5)
@@ -86,21 +87,79 @@ def fetch_openstates_bills(person_id):
     bills = r.json().get("results", [])
     return [f"- {b.get('identifier','?')} — {b.get('title','No title')}" for b in bills] or ["- None"]
 
+@st.cache_data(ttl=86400)
+def fetch_congress_members_by_state(state_code):
+    """Fetches current Congress members for a specific state to use as a fallback lookup."""
+    if not CONGRESS_API_KEY or not state_code:
+        return []
+    params = {"format": "json", "api_key": CONGRESS_API_KEY, "limit": 250, "currentMember": "true"}
+    r = requests.get(f"{BASE_CONG}/member/{state_code}", params=params, timeout=15)
+    if r.ok:
+        return r.json().get("members", [])
+    return []
+
+def resolve_bioguide_id(person_dict, state_code):
+    """Finds Bioguide ID either directly from OpenStates or via a fallback Congress.gov name match."""
+    # 1. Try to find the exact ID natively in OpenStates identifiers
+    for ident in person_dict.get("identifiers", []):
+        if ident.get("scheme") == "bioguide":
+            return ident.get("identifier")
+            
+    # 2. Fallback: Lookup by name using the Congress API
+    if not state_code:
+        return None
+        
+    name = person_dict.get("name", "")
+    if not name:
+        return None
+        
+    name_parts = name.split()
+    if len(name_parts) < 2:
+        return None
+        
+    first_name = name_parts[0].lower()
+    last_name = name_parts[-1].lower()
+    
+    members = fetch_congress_members_by_state(state_code)
+    for m in members:
+        m_name = m.get("name", "").lower()
+        if last_name in m_name and first_name in m_name:
+            return m.get("bioguideId")
+            
+    return None
+
 @st.cache_data(ttl=600)
-def fetch_congress_bills_by_name(name):
-    """Fetches recent bills from Congress.gov by name."""
+def fetch_congress_bills(bioguide_id):
+    """Fetches recent bills sponsored by a federal member from Congress.gov."""
     if not CONGRESS_API_KEY:
         return ["- congress.gov key not configured"]
-    params = {"q": name, "format": "json", "limit": 5, "api_key": CONGRESS_API_KEY}
-    r = requests.get(f"{BASE_CONG}/bill", headers=HEADERS_CONG, params=params, timeout=16)
+    if not bioguide_id:
+        return ["- No bioguide ID available to fetch bills"]
+        
+    params = {"format": "json", "limit": 5, "api_key": CONGRESS_API_KEY}
+    r = requests.get(f"{BASE_CONG}/member/{bioguide_id}/sponsored-legislation", headers=HEADERS_CONG, params=params, timeout=16)
+    
     if r.status_code == 429:
         time.sleep(1.5)
         return ["- Rate limited (429) — try again shortly"]
     if not r.ok:
         return [f"- Congress.gov error {r.status_code}"]
+        
     data = r.json() or {}
-    bills = data.get("bills", [])
-    return [f"- [{b.get('congress','')} {b.get('number','')}] {b.get('title','No title')}" for b in bills] or ["- None"]
+    bills = data.get("sponsoredLegislation", [])
+    
+    results = []
+    for b in bills[:5]:
+        congress = b.get("congress", "?")
+        b_type = b.get("type", "")
+        b_num = b.get("number", "")
+        title = b.get("title") or "No title available"
+        
+        # Format the badge cleanly, removing extra spaces if type/num are missing
+        badge = f"[{congress} {b_type} {b_num}]".replace("  ", " ").replace(" ]", "]")
+        results.append(f"- {badge} {title}")
+        
+    return results or ["- None"]
     
 # ======= UI =======
 st.set_page_config(page_title="Who Represents Me", layout="wide")
@@ -110,25 +169,21 @@ col1, col2, col3 = st.columns(3)
 with col1:
     loc = st.text_input("Location (City, State)", placeholder="e.g., Detroit, MI")
 with col2:
-    # Use format="%.6f" to match the precision from your Gradio app
     lat_in = st.number_input("Latitude", value=None, placeholder="e.g., 42.3314", format="%.6f")
 with col3:
     lng_in = st.number_input("Longitude", value=None, placeholder="e.g., -83.0458", format="%.6f")
 
-# Use st.session_state to mimic the RUN_LOCK and prevent multiple clicks
 if 'running' not in st.session_state:
     st.session_state.running = False
 
-# This is the main output area
 output_area = st.empty()
 output_area.markdown("🔹 Ready")
 
 if st.button("Find My Representatives", type="primary", disabled=st.session_state.running):
     st.session_state.running = True
     lat, lng = lat_in, lng_in
-    out = [] # This will store our markdown lines
+    out = [] 
     
-    # st.status is the Streamlit equivalent of your streaming loader
     with st.status("⏳ Starting lookup…") as status:
         try:
             # 1) Resolve coordinates
@@ -139,7 +194,7 @@ if st.button("Find My Representatives", type="primary", disabled=st.session_stat
                     output_area.error(geo_err)
                     status.error("Geocoding failed.")
                     st.session_state.running = False
-                    st.rerun() # Use rerun to re-enable button
+                    st.rerun()
             
             if lat is None or lng is None:
                 output_area.error(jerr("InputError", "Provide coordinates or a City, State string."))
@@ -159,12 +214,20 @@ if st.button("Find My Representatives", type="primary", disabled=st.session_stat
                 status.error("Failed to fetch representatives.")
                 st.session_state.running = False
                 st.rerun()
-                
+
             if not people:
                 output_area.warning(jerr("EmptyResults", "No representatives found.", {"lat": lat, "lng": lng}))
                 status.warning("No representatives found.")
                 st.session_state.running = False
                 st.rerun()
+                
+            # Extract state code for fallback Congress member lookup
+            state_code = None
+            for p in people:
+                jid = p.get("jurisdiction", {}).get("id", "")
+                if "state:" in jid:
+                    state_code = jid.split("state:")[1].split("/")[0].upper()
+                    break
 
             status.update(label=f"✅ Found {len(people)} reps. Fetching bills…")
 
@@ -194,10 +257,16 @@ if st.button("Find My Representatives", type="primary", disabled=st.session_stat
                 # Bills: use OpenStates for state/local; Congress.gov for federal
                 if is_federal(juris):
                     out.append("\n**Federal (Congress.gov)**")
-                    out += fetch_congress_bills_by_name(name)
+                    
+                    bioguide_id = resolve_bioguide_id(p, state_code)
+                    if bioguide_id:
+                        out += fetch_congress_bills(bioguide_id)
+                    else:
+                        out.append("- *Missing Bioguide ID for sponsor search*")
                 else:
                     out.append("\n**State (OpenStates)**")
-                    out += fetch_openstates_bills(person_id=p.get("id",""))
+                    juris_id = juris.get("id", "")
+                    out += fetch_openstates_bills(p.get("id", ""), juris_id)
 
                 out.append("\n---\n")
                 
@@ -219,6 +288,4 @@ if st.button("Find My Representatives", type="primary", disabled=st.session_stat
             status.error("An unexpected error occurred.")
         
         finally:
-            # MUST reset the lock
             st.session_state.running = False
-            # We don't rerun here, so the final output stays
