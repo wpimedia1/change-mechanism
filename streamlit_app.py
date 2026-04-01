@@ -150,7 +150,7 @@ def fetch_congress_bills(bioguide_id):
     return results or ["- None"]
     
 # ======= UI =======
-st.set_page_config(page_title="Who Represents Me", layout="wide")
+st.set_page_config(page_title="Who Reps Me | Civic Map", layout="wide")
 st.title("🏛️ Who Represents Me")
 
 col1, col2, col3 = st.columns(3)
