@@ -1,12 +1,10 @@
-# 🏛️ Who Represents Me
+# Who Represents Me
 
-A Streamlit app that finds your elected representatives by location using the [OpenStates API](https://docs.openstates.org/api-v3/) and [Congress.gov API](https://api.congress.gov/), with recent bill activity for each legislator.
-
-Enter a city/state or coordinates → get your state and federal reps, contact info, and recent bills.
+A Streamlit app that finds elected representatives by location using the OpenStates API and Congress.gov API, including recent bill activity.
 
 ## Setup
 
-### 1. Clone and install
+### 1) Clone and install
 
 ```bash
 git clone https://github.com/wpimedia1/change-mechanism.git
@@ -14,7 +12,7 @@ cd change-mechanism
 pip install -r requirements.txt
 ```
 
-### 2. Add API keys
+### 2) Add API keys
 
 Create `.streamlit/secrets.toml` in the project root:
 
@@ -23,56 +21,40 @@ OPEN_API_KEY = "your-openstates-api-key"
 CONGRESS_API_KEY = "your-congress-gov-api-key"  # optional
 ```
 
-- **OpenStates key** (required): Register at [openstates.org/accounts/signup](https://openstates.org/accounts/signup/)
-- **Congress.gov key** (optional): Register at [api.congress.gov/sign-up](https://api.congress.gov/sign-up/)
+- OpenStates key (required): https://openstates.org/accounts/signup/
+- Congress.gov key (optional): https://api.congress.gov/sign-up/
 
-> ⚠️ Do not commit `secrets.toml` — it is in `.gitignore`.
+Do not commit `secrets.toml`; it is ignored by `.gitignore`.
 
-### 3. Run
+### 3) Run
 
 ```bash
-streamlit run app.py
+streamlit run streamlit_app.py
 ```
 
-## How it works
+## Tests
 
-1. Geocodes your location via [Nominatim](https://nominatim.openstreetmap.org/) (OpenStreetMap)
-2. Looks up representatives at those coordinates via OpenStates `people.geo`
-3. Fetches recent bills — OpenStates for state legislators, Congress.gov for federal
-4. Displays results progressively with contact info and bill summaries
+Run the full test suite:
 
-## Project structure
-
-```
-├── app.py                     # Main application
-├── requirements.txt           # streamlit, requests
-├── .streamlit/
-│   └── secrets.toml           # API keys (not committed)
-└── .gitignore
+```bash
+pytest -q
 ```
 
-## Configuration
+## Security Notes
 
-All tunable values are constants at the top of `app.py`:
+- OpenStates key is sent in `X-Api-Key` header.
+- Congress.gov key is intentionally sent as `api_key` query parameter for provider compatibility.
+- If you deploy behind a reverse proxy, disable or redact query-string logging for `api_key`.
+- See [SECURITY_CHECKLIST.md](SECURITY_CHECKLIST.md) for deployment guidance.
 
-| Constant | Default | Purpose |
-|----------|---------|---------|
-| `COOLDOWN_SECONDS` | `5` | Min seconds between lookups per session |
-| `BILLS_PER_PAGE` | `5` | Recent bills fetched per legislator |
-| `API_TIMEOUT` | `20` | Timeout for OpenStates people lookup |
-| `GEOCODE_TIMEOUT` | `12` | Timeout for Nominatim geocoding |
+## Project Structure
 
-## Caching
-
-- Geocoding results cached 1 hour (`st.cache_data`, `ttl=3600`)
-- Representative and bill data cached 10 minutes (`ttl=600`)
-- Cache is global across sessions — identical lookups share results
-
-## Deployment
-
-Works on [Streamlit Community Cloud](https://streamlit.io/cloud) — paste your `secrets.toml` contents into the app's **Advanced Settings > Secrets** panel during deployment.
-
-For other platforms, set `OPEN_API_KEY` and `CONGRESS_API_KEY` as environment variables or provide a `secrets.toml` per [Streamlit docs](https://docs.streamlit.io/deploy/concepts/secrets).
+```text
+streamlit_app.py
+tests/test_streamlit_app.py
+requirements.txt
+SECURITY_CHECKLIST.md
+```
 
 ## License
 
